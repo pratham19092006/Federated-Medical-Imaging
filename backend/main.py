@@ -172,7 +172,7 @@ MODEL_CONFIGS = {
     }
 }
 
-# Loaded PyTorch models storage
+# Loaded PyTorch models storage (kept empty; models are loaded on-demand to respect 512MB RAM)
 loaded_models = {}
 
 def get_resnet18_model():
@@ -180,35 +180,39 @@ def get_resnet18_model():
     model.fc = nn.Linear(512, 2)
     return model
 
-def load_all_checkpoints():
-    print("Loading PyTorch model checkpoints...")
-    for model_key, cfg in MODEL_CONFIGS.items():
-        if model_key == "DP-FedAvg":
-            # Reserved slot
-            continue
-        ckpt_filename = cfg["checkpoint"]
-        ckpt_path = os.path.join(CHECKPOINTS_DIR, ckpt_filename)
-        if os.path.exists(ckpt_path):
-            try:
-                model = get_resnet18_model()
-                # weights_only=False is required because some checkpoints contain
-                # numpy scalars (trusted source: own training outputs).
-                checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-                state_dict = checkpoint.get("model_state_dict", checkpoint)
-                model.load_state_dict(state_dict)
-                model.eval()
-                loaded_models[model_key] = model
-                del checkpoint
-                del state_dict
-                gc.collect()
-                print(f"Successfully loaded checkpoint for {model_key} from {ckpt_filename}")
-            except Exception as e:
-                print(f"Failed to load checkpoint for {model_key}: {e}")
-        else:
-            print(f"Checkpoint not found for {model_key} at {ckpt_path}")
+def load_model_checkpoint(model_key: str):
+    """
+    Load a single model checkpoint on demand.
+    Returns the loaded model or None if unavailable/failed.
+    Releases temporary checkpoint dictionary and calls gc.collect() immediately.
+    """
+    if model_key not in MODEL_CONFIGS or model_key == "DP-FedAvg":
+        return None
 
-# Run checkpoint loading on startup
-load_all_checkpoints()
+    cfg = MODEL_CONFIGS[model_key]
+    ckpt_filename = cfg.get("checkpoint")
+    if not ckpt_filename:
+        return None
+
+    ckpt_path = os.path.join(CHECKPOINTS_DIR, ckpt_filename)
+    if not os.path.isfile(ckpt_path):
+        return None
+
+    try:
+        model = get_resnet18_model()
+        # weights_only=False is required because some checkpoints contain
+        # numpy scalars (trusted source: own training outputs).
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        model.load_state_dict(state_dict)
+        model.eval()
+        del checkpoint
+        del state_dict
+        gc.collect()
+        return model
+    except Exception as e:
+        print(f"Error loading checkpoint for {model_key} from {ckpt_filename}: {e}")
+        return None
 
 # Standard evaluation transform
 eval_transform = transforms.Compose([
@@ -223,37 +227,46 @@ eval_transform = transforms.Compose([
 ALLOWED_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 
 def process_and_run_inference(image_bytes: bytes, model_key: str):
-    if model_key not in loaded_models:
-        if model_key == "DP-FedAvg":
-            return {
-                "name": "DP-FedAvg",
-                "title": MODEL_CONFIGS["DP-FedAvg"]["title"],
-                "type": MODEL_CONFIGS["DP-FedAvg"]["type"],
-                "status": "coming_soon",
-                "available": False,
-                "reason": "Checkpoint not available. Implementation under future extension."
-            }
-        raise HTTPException(status_code=400, detail=f"Model '{model_key}' checkpoint is not loaded.")
-    
+    if model_key == "DP-FedAvg":
+        return {
+            "name": "DP-FedAvg",
+            "title": MODEL_CONFIGS["DP-FedAvg"]["title"],
+            "type": MODEL_CONFIGS["DP-FedAvg"]["type"],
+            "status": "coming_soon",
+            "available": False,
+            "reason": "Checkpoint not available. Implementation under future extension."
+        }
+
+    if model_key not in MODEL_CONFIGS:
+        raise HTTPException(status_code=400, detail=f"Model '{model_key}' is not recognized.")
+
+    cfg = MODEL_CONFIGS[model_key]
+    ckpt_filename = cfg.get("checkpoint")
+    ckpt_path = os.path.join(CHECKPOINTS_DIR, ckpt_filename) if ckpt_filename else None
+    if not ckpt_path or not os.path.isfile(ckpt_path):
+        raise HTTPException(status_code=400, detail=f"Model '{model_key}' checkpoint is not available.")
+
+    model = load_model_checkpoint(model_key)
+    if model is None:
+        raise HTTPException(status_code=500, detail=f"Failed to load checkpoint for {model_key}.")
+
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         orig_width, orig_height = img.size
         resized = (orig_width != 96 or orig_height != 96)
-        
-        tensor = eval_transform(img).unsqueeze(0) # [1, 3, 96, 96]
-        model = loaded_models[model_key]
-        
+
+        tensor = eval_transform(img).unsqueeze(0)  # [1, 3, 96, 96]
+
         with torch.no_grad():
             logits = model(tensor)
             probs = torch.softmax(logits, dim=1).squeeze(0)
             normal_prob = float(probs[0].item())
             anomalous_prob = float(probs[1].item())
-            
+
         predicted_idx = 1 if anomalous_prob > normal_prob else 0
         predicted_class = "Anomalous" if predicted_idx == 1 else "Normal"
         confidence = float(max(normal_prob, anomalous_prob))
-        
-        cfg = MODEL_CONFIGS[model_key]
+
         return {
             "name": model_key,
             "title": cfg["title"],
@@ -273,23 +286,32 @@ def process_and_run_inference(image_bytes: bytes, model_key: str):
             "badge": cfg.get("badge"),
             "is_best": cfg.get("is_best", False)
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error processing image for {model_key}: {str(e)}")
+    finally:
+        del model
+        gc.collect()
 
 # API Endpoints
 
 @app.get("/api/health")
 def get_health():
-    loaded_keys = list(loaded_models.keys())
+    available_models = [
+        k for k, cfg in MODEL_CONFIGS.items()
+        if k != "DP-FedAvg" and os.path.isfile(os.path.join(CHECKPOINTS_DIR, cfg.get("checkpoint", "")))
+    ]
+    pending_models = [k for k in MODEL_CONFIGS if k not in available_models]
     return {
         "status": "online",
         "service": "Camelyon17 Research Inference Engine",
         "pytorch_version": torch.__version__,
         "device": "CPU",
-        "loaded_models_count": len(loaded_keys),
-        "loaded_models": loaded_keys,
-        "available_models": ["GroupDRO", "ERM", "FedProx", "DP-WHFedDG", "FedAvg"],
-        "pending_models": ["DP-FedAvg"]
+        "loaded_models_count": len(loaded_models),
+        "loaded_models": list(loaded_models.keys()),
+        "available_models": available_models,
+        "pending_models": pending_models
     }
 
 @app.get("/api/models")
@@ -297,7 +319,9 @@ def get_models():
     models_info = []
     for key, cfg in MODEL_CONFIGS.items():
         item = dict(cfg)
-        item["available"] = (key in loaded_models)
+        ckpt_filename = cfg.get("checkpoint")
+        ckpt_path = os.path.join(CHECKPOINTS_DIR, ckpt_filename) if ckpt_filename else None
+        item["available"] = bool(ckpt_path and os.path.isfile(ckpt_path) and key != "DP-FedAvg")
         models_info.append(item)
     return {"models": models_info}
 
@@ -308,7 +332,7 @@ async def predict_single(file: UploadFile = File(...), model_name: str = Form("G
     contents = await file.read()
     if len(contents) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File too large. Limit is 10 MB.")
-    
+
     result = process_and_run_inference(contents, model_name)
     return result
 
@@ -319,18 +343,19 @@ async def predict_all(file: UploadFile = File(...)):
     contents = await file.read()
     if len(contents) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File too large. Limit is 10 MB.")
-    
+
     img = Image.open(io.BytesIO(contents)).convert("RGB")
     orig_width, orig_height = img.size
     resized = (orig_width != 96 or orig_height != 96)
-    
+    tensor = eval_transform(img).unsqueeze(0)
+
     results = []
     for model_key in ["ERM", "FedAvg", "FedProx", "GroupDRO", "DP-WHFedDG", "DP-FedAvg"]:
-        if model_key in loaded_models:
-            res = process_and_run_inference(contents, model_key)
-            results.append(res)
-        else:
-            cfg = MODEL_CONFIGS[model_key]
+        cfg = MODEL_CONFIGS[model_key]
+        ckpt_filename = cfg.get("checkpoint")
+        ckpt_path = os.path.join(CHECKPOINTS_DIR, ckpt_filename) if ckpt_filename else None
+
+        if model_key == "DP-FedAvg" or not ckpt_path or not os.path.isfile(ckpt_path):
             results.append({
                 "name": model_key,
                 "title": cfg["title"],
@@ -340,7 +365,69 @@ async def predict_all(file: UploadFile = File(...)):
                 "reason": "Checkpoint not available",
                 "badge": cfg.get("badge")
             })
-            
+            continue
+
+        model = load_model_checkpoint(model_key)
+        if model is None:
+            results.append({
+                "name": model_key,
+                "title": cfg["title"],
+                "type": cfg["type"],
+                "status": "coming_soon",
+                "available": False,
+                "reason": "Checkpoint failed to load",
+                "badge": cfg.get("badge")
+            })
+            continue
+
+        try:
+            with torch.no_grad():
+                logits = model(tensor)
+                probs = torch.softmax(logits, dim=1).squeeze(0)
+                normal_prob = float(probs[0].item())
+                anomalous_prob = float(probs[1].item())
+
+            predicted_idx = 1 if anomalous_prob > normal_prob else 0
+            predicted_class = "Anomalous" if predicted_idx == 1 else "Normal"
+            confidence = float(max(normal_prob, anomalous_prob))
+
+            results.append({
+                "name": model_key,
+                "title": cfg["title"],
+                "type": cfg["type"],
+                "status": "available",
+                "available": True,
+                "prediction": predicted_class,
+                "confidence": confidence,
+                "confidence_percent": round(confidence * 100, 2),
+                "normal_probability": normal_prob,
+                "normal_percent": round(normal_prob * 100, 2),
+                "anomalous_probability": anomalous_prob,
+                "anomalous_percent": round(anomalous_prob * 100, 2),
+                "original_size": [orig_width, orig_height],
+                "target_size": [96, 96],
+                "resized": resized,
+                "badge": cfg.get("badge"),
+                "is_best": cfg.get("is_best", False)
+            })
+        except Exception as e:
+            print(f"Inference error for {model_key}: {e}")
+            results.append({
+                "name": model_key,
+                "title": cfg["title"],
+                "type": cfg["type"],
+                "status": "coming_soon",
+                "available": False,
+                "reason": f"Inference error: {str(e)}",
+                "badge": cfg.get("badge")
+            })
+        finally:
+            del model
+            gc.collect()
+
+    del tensor
+    gc.collect()
+
     return {
         "timestamp": time.time(),
         "input_info": {
