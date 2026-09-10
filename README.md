@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Federated Medical Imaging
 ### Domain-Generalized Federated Learning for Robust Privacy-Preserving Medical Diagnosis Across Hospitals
 
@@ -214,3 +215,7 @@ Research project on federated domain generalization for medical imaging.
 ---
 
 *Research Prototype · Not for clinical diagnosis*
+=======
+# Federated-Medical-Imaging
+A privacy-preserving federated domain generalization framework for robust medical image classification across heterogeneous hospitals, combining worst-hospital risk awareness and differential privacy, with evaluation on an unseen hospital using Camelyon17.
+>>>>>>> 8684d4167bddb8996d63a2e5539fec676eee84c3
