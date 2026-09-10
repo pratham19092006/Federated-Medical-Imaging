@@ -13,9 +13,9 @@ venv/
 .venv/
 env/
 
-# PyTorch checkpoints (large binary files - excluded from repo)
-# Place checkpoint files in checkpoints/ after cloning from a separate source
-checkpoints/
+# PyTorch checkpoints (tracked via Git LFS - see .gitattributes)
+!checkpoints/
+!checkpoints/*.pt
 
 # Model weights directory (original large .pt files)
 Models_weights/

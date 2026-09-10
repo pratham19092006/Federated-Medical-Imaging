@@ -1,6 +1,7 @@
 import os
 import io
 import time
+import gc
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
@@ -9,6 +10,9 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
+
+# Limit PyTorch to single thread to conserve memory on Render 512 MB RAM free tier
+torch.set_num_threads(1)
 
 app = FastAPI(
     title="Camelyon17 Research Demonstration Platform",
@@ -194,6 +198,9 @@ def load_all_checkpoints():
                 model.load_state_dict(state_dict)
                 model.eval()
                 loaded_models[model_key] = model
+                del checkpoint
+                del state_dict
+                gc.collect()
                 print(f"Successfully loaded checkpoint for {model_key} from {ckpt_filename}")
             except Exception as e:
                 print(f"Failed to load checkpoint for {model_key}: {e}")
